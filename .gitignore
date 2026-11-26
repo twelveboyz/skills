@@ -1,3 +1,5 @@
 # nested skill repos
 bpm/.git/
 net-capture/.git/
+# 不纳入本仓库（本地独立仓库）
+bpm/
