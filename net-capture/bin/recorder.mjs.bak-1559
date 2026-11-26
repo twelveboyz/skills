@@ -1,0 +1,170 @@
+#!/usr/bin/env node
+// recorder.mjs：CDP 记录器。由 capture.mjs start 以 detached 方式拉起。
+import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { redactBody, redactHeaders, redactText } from '../lib/redact.mjs';
+
+const argv = process.argv.slice(2);
+function arg(name, fallback) {
+  const i = argv.indexOf(name);
+  return i >= 0 ? argv[i + 1] : fallback;
+}
+
+const outDir = arg('--out', join(process.cwd(), '.capture'));
+const port = Number(arg('--port', readBrowserPort()));
+const POLL_MS = 2000;
+const STATE_MS = 5000;
+const BODY_LIMIT = 8192;
+
+const STATIC = /\.(js|css|png|jpe?g|svg|woff2?|gif|ico)(\?|$)/i;
+const STATIC_DIR = /\/(static|assets)\//i;
+
+function readBrowserPort() {
+  const p = join(process.env.LOCALAPPDATA ?? '', 'ego-lite-linux', 'browser.json');
+  try {
+    return JSON.parse(readFileSync(p, 'utf8')).port;
+  } catch {
+    console.error(`找不到 ego 浏览器端口：${p}；请用 --port 指定`);
+    process.exit(1);
+  }
+}
+
+let records = 0;
+const targets = new Map(); // targetId -> {ws, pages:Map, pend:Map, seq}
+const pending = new Map(); // requestId -> 请求阶段已收齐的字段
+
+mkdirSync(outDir, { recursive: true });
+
+function writeRecord(rec) {
+  appendFileSync(join(outDir, 'net.jsonl'), JSON.stringify(rec) + '\n');
+  records++;
+  writeState(); // 先落 JSONL 再抬条数，state 永远不领先于文件
+}
+
+function writeState() {
+  writeFileSync(
+    join(outDir, 'state.json'),
+    JSON.stringify({ records, targets: targets.size, updatedAt: Date.now() }),
+  );
+}
+
+async function poll() {
+  let list;
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/json/list`);
+    list = await res.json();
+  } catch {
+    return;
+  }
+  const seen = new Set();
+  for (const t of list) {
+    if (t.type !== 'page') continue;
+    seen.add(t.id);
+    if (!targets.has(t.id)) connect(t);
+  }
+  for (const [id, t] of targets) {
+    if (!seen.has(id)) {
+      t.ws.close();
+      targets.delete(id);
+    }
+  }
+}
+
+function connect(t) {
+  const ws = new WebSocket(t.webSocketDebuggerUrl);
+  const entry = { ws, pend: new Map(), seq: 0, url: t.url };
+  targets.set(t.id, entry);
+  ws.addEventListener('open', () => {
+    send(t.id, 'Network.enable', {});
+  });
+  ws.addEventListener('message', (e) => onEvent(t.id, JSON.parse(e.data)));
+  ws.addEventListener('close', () => targets.delete(t.id));
+  ws.addEventListener('error', () => {});
+}
+
+function send(targetId, method, params) {
+  const t = targets.get(targetId);
+  if (!t) return;
+  t.ws.send(JSON.stringify({ id: ++t.seq, method, params }));
+}
+
+function onEvent(targetId, msg) {
+  const { method, params } = msg;
+  if (!params?.requestId) return;
+
+  if (method === 'Network.requestWillBeSent') {
+    const { request, type } = params;
+    if (type !== 'XHR' && type !== 'Fetch') return;
+    if (request.method === 'OPTIONS') return;
+    if (STATIC.test(request.url) || STATIC_DIR.test(request.url)) return;
+    pending.set(params.requestId, {
+      ts: new Date().toISOString(),
+      targetId,
+      pageUrl: targets.get(targetId)?.url ?? '',
+      method: request.method,
+      url: request.url,
+      reqHeaders: request.headers,
+      postData: request.postData ?? null,
+      t0: Date.now(),
+    });
+  } else if (method === 'Network.responseReceived') {
+    const p = pending.get(params.requestId);
+    if (!p) return;
+    p.status = params.response.status;
+    p.mimeType = params.response.mimeType;
+    p.respHeaders = params.response.headers;
+  } else if (method === 'Network.loadingFinished') {
+    const p = pending.get(params.requestId);
+    if (!p) return;
+    pending.delete(params.requestId);
+    finish(targetId, params.requestId, p);
+  }
+}
+
+function finish(targetId, requestId, p) {
+  const t = targets.get(targetId);
+  if (!t) return;
+  const id = ++t.seq;
+  t.pend.set(id, { ...p, t0: p.t0 });
+  t.ws.send(JSON.stringify({ id, method: 'Network.getResponseBody', params: { requestId } }));
+  t.ws.addEventListener('message', onBody);
+  function onBody(e) {
+    const msg = JSON.parse(e.data);
+    const rec = t.pend.get(msg.id);
+    if (!rec) return;
+    t.pend.delete(msg.id);
+    t.ws.removeEventListener('message', onBody);
+    let body = msg.error ? null : msg.result.body;
+    let bodyError = msg.error ? msg.error.message : undefined;
+    writeRecord({
+      ts: rec.ts,
+      targetId: rec.targetId,
+      pageUrl: rec.pageUrl,
+      method: rec.method,
+      url: rec.url,
+      reqHeaders: redactHeaders(rec.reqHeaders),
+      postData: rec.postData === null ? null : redactText(rec.postData),
+      status: rec.status ?? null,
+      mimeType: rec.mimeType ?? null,
+      respHeaders: redactHeaders(rec.respHeaders ?? {}),
+      body: body === undefined ? null : redactBody(body, BODY_LIMIT).body,
+      ...(redactBody(body, BODY_LIMIT).bodyTruncated ? { bodyTruncated: true } : {}),
+      ...(bodyError ? { bodyError } : {}),
+      durMs: Date.now() - rec.t0,
+    });
+  }
+}
+
+function shutdown() {
+  writeState();
+  rmSync(join(outDir, 'recorder.pid'), { force: true });
+  process.exit(0);
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
+poll();
+setInterval(poll, POLL_MS);
+setInterval(writeState, STATE_MS);
+writeState();

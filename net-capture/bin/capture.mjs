@@ -1,0 +1,458 @@
+#!/usr/bin/env node
+// net-capture CLI：start / stop / status / report / log
+import { execFileSync, spawn } from 'node:child_process';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const RECORDER = join(HERE, 'recorder.mjs');
+const GEN = join(HERE, 'gen-report.mjs');
+
+function parseArgs(argv) {
+  const opts = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--out') opts.out = argv[++i];
+    else if (a === '--fresh') opts.fresh = true;
+    else opts._.push(a);
+  }
+  return opts;
+}
+
+function readPidFile(outDir) {
+  const file = join(outDir, 'recorder.pid');
+  if (!existsSync(file)) return null;
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+// state.json 只用来取条数，不参与"跑没跑"的判断（规格 4.2 / 第 7 节）。
+function countRecords(outDir) {
+  try {
+    return JSON.parse(readFileSync(join(outDir, 'state.json'), 'utf8')).records ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function flagValue(name) {
+  const i = process.argv.indexOf(name);
+  return i >= 0 ? process.argv[i + 1] : undefined;
+}
+
+function readBrowserPort() {
+  const file = join(process.env.LOCALAPPDATA ?? '', 'ego-lite-linux', 'browser.json');
+  try {
+    return JSON.parse(readFileSync(file, 'utf8')).port;
+  } catch {
+    return null;
+  }
+}
+
+function readJsonl(outDir) {
+  const file = join(outDir, 'net.jsonl');
+  if (!existsSync(file)) return [];
+  const rows = [];
+  for (const line of readFileSync(file, 'utf8').split('\n')) {
+    if (!line) continue;
+    try {
+      rows.push(JSON.parse(line));
+    } catch {
+      // recorder 被强杀时最后一行可能是半截，跳过即可
+    }
+  }
+  return rows;
+}
+
+// 同一接口 = 同方法 + 同主机 + 同路径，查询串不同也算同一个。
+function summarize(rows) {
+  const hosts = new Map();
+  const apis = new Set();
+  for (const r of rows) {
+    const u = new URL(r.url);
+    hosts.set(u.host, (hosts.get(u.host) ?? 0) + 1);
+    apis.add(`${r.method} ${u.host}${u.pathname}`);
+  }
+  return { hosts, apis: apis.size };
+}
+
+// 匹配串归一化：命令行里存的分隔符取决于起 recorder 的人怎么写 --out，正斜杠和反斜杠都会出现。
+// 统一转成反斜杠再转小写（Windows 路径大小写不敏感），两边用同一形态比较。
+// 边界：dir 后面必须跟分隔符或引号或空白，否则 F:\a 会命中 F:\a\b 的 recorder，stop 会误杀别的目录。
+// 不能直接给 dir 补尾部反斜杠：命令行里 --out 后面可能紧跟空格或引号，补了就匹配不上自己。
+function normalizeForMatch(dir) {
+  return resolve(dir).replace(/\//g, '\\').toLowerCase();
+}
+
+function commandMatchesDir(cmd, dir) {
+  const needle = normalizeForMatch(dir).replace(/\\+/g, '\\');
+  // 先压连续反斜杠：手写 --out C:\\a\\b 这种写法要能和单反斜杠的目录对上
+  const raw = (cmd ?? '').replace(/\//g, '\\');
+  // 先按 --out 的值精确比：命令行里 --out 后面就是 recorder 实际的输出目录，
+  // 直接比这一整串，父目录和子目录天然不会串台。
+  // 必须按 token 切，不能直接扫字符串：Start-Process 起进程时每个参数都带引号，
+  // 命令行形态是 "--out" "F:\a\b"，按 " 找值会把引号和空格吃进路径里，判不出相等。
+  // token 化同时解决 --outdir 这类更长参数的误认：只认整 token 等于 --out 的。
+  const tokens = [];
+  const tre = /"([^"]*)"|(\S+)/g;
+  let tm;
+  while ((tm = tre.exec(raw)) !== null) tokens.push((tm[1] ?? tm[2]).replace(/\\+/g, '\\').toLowerCase());
+  const outAt = tokens.lastIndexOf('--out');
+  if (outAt >= 0 && outAt + 1 < tokens.length) {
+    return tokens[outAt + 1].replace(/\\+$/, '') === needle;
+  }
+  const hay = raw.replace(/\\+/g, '\\').toLowerCase();
+  // 命令行里没有 --out（手工起的进程）：退回到带边界的前缀匹配
+  let scan = 0;
+  for (;;) {
+    const at = hay.indexOf(needle, scan);
+    if (at < 0) return false;
+    const next = hay[at + needle.length];
+    if (next === undefined || next === '\\' || next === '/' || next === '"' || next === ' ' || next === '\t') {
+      return true;
+    }
+    scan = at + 1;
+  }
+}
+
+// 列出所有跑在 outDir 上的 recorder 进程（CommandLine 里同时带 recorder.mjs 与归一化后的 outDir）。
+// 用 .Contains 不用 -like：-like 把 [ ] * ? 当通配符，目录名带这些字符就匹配不上。
+// PowerShell 只做粗筛（带 recorder.mjs 且含归一化目录），路径边界由 commandMatchesDir 精判：
+// PowerShell 的 .Contains 没有边界概念，F:\a 会命中 F:\a\b，stop 就会误杀别的目录。
+function findRecorderPids(outDir) {
+  const dir = normalizeForMatch(outDir);
+  // PowerShell 只做粗筛：带 recorder.mjs 且规范化后含目录。路径边界由 commandMatchesDir 精判。
+  // 规范化 = 正斜杠转反斜杠、连续反斜杠压成一个、转小写。双反斜杠写法在这一步就被抹平。
+  const script =
+    PS_UTF8 +
+    `$needle = '${dir}'; ` +
+    `Get-CimInstance Win32_Process -Filter "Name='node.exe'" | ` +
+    `Where-Object { $_.CommandLine -and ` +
+    `$_.CommandLine.Contains('recorder.mjs') -and ` +
+    `$_.CommandLine.Replace('/','\\').ToLowerInvariant().Replace('\\\\','\\').IndexOf($needle) -ge 0 } | ` +
+    `ForEach-Object { $_.ProcessId.ToString() + '|' + $_.CommandLine }`;
+  try {
+    const out = execFileSync('powershell', ['-NoProfile', '-Command', script], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    });
+    return out
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .flatMap((line) => {
+        const [pidText, ...rest] = line.split('|');
+        const cmd = rest.join('|');
+        // 精判：目录后面必须是分隔符、引号、空白或结尾，避免父目录命中子目录
+        return commandMatchesDir(cmd, outDir) ? [Number(pidText)] : [];
+      });
+  } catch {
+    return [];
+  }
+}
+
+function findRecorderPid(outDir) {
+  return findRecorderPids(outDir)[0] ?? null;
+}
+
+// PowerShell 默认按系统代码页往管道写，node 按 utf8 读就把中文路径解成问号，
+// 命令行里再也找不到本目录。先逼 PowerShell 用 utf8 输出，两边编码才对得上。
+const PS_UTF8 = '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; ';
+
+// 问 PowerShell 一次，拿某个 pid 的「活着 + 命令行」。走同一次 CIM，不拆成 tasklist 加 CIM 两步，
+// 避免 TOCTOU 和两套匹配串。进程不在时返回 null。
+function procInfo(pid) {
+  try {
+    const raw = execFileSync(
+      'powershell',
+      ['-NoProfile', '-Command',
+        PS_UTF8 +
+        `Get-CimInstance Win32_Process -Filter "ProcessId=${Number(pid)}" | ` +
+        `ForEach-Object { $_.ProcessId.ToString() + "|" + $_.CommandLine }`],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
+    ).trim();
+    if (!raw) return null;
+    const [pidText, ...rest] = raw.split('|');
+    return { pid: Number(pidText), cmd: rest.join('|') };
+  } catch {
+    return null;
+  }
+}
+
+// Windows 三态：pid 文件优先，清单兜底。
+// running / unknown / stopped。unknown = pid 活着但命令行不含本目录，多半是系统复用了这个 pid，
+// 杀错进程比停不掉更糟，所以 start 拒绝、stop 只打印不杀。
+// 两个来源都要核对命令行含本目录：只看「活着」会把别人占用的 pid 当成自己的 recorder。
+// 全程一次幂等，不做第二次查询，避免两次判定之间判据漂移。
+function procState(outDir) {
+  const filePid = readPidFile(outDir)?.pid;
+  if (filePid) {
+    const proc = procInfo(filePid);
+    if (proc && (proc.cmd ?? '').includes('recorder.mjs')) {
+      // 和 findRecorderPids 用同一个匹配口径，否则正斜杠启动的 recorder 会被判成 unknown
+      return commandMatchesDir(proc.cmd, outDir)
+        ? { state: 'running', pid: filePid }
+        : { state: 'unknown', pid: filePid, cmd: proc.cmd };
+    }
+    // pid 已死，或已被别的程序复用：都不是本目录的 recorder。
+    // 都不算本目录的 recorder，pid 不往上报
+    return { state: 'stopped', pid: null };
+  }
+  // pid 文件不存在：回落到进程清单，只查一次，不重复调用
+  const pid = findRecorderPid(outDir);
+  return pid === null ? { state: 'stopped', pid: null } : { state: 'running', pid };
+}
+
+function isRunning(outDir) {
+  if (process.platform === 'win32') return procState(outDir).state === 'running';
+  const info = readPidFile(outDir);
+  return !!info && isAlive(info.pid);
+}
+
+// 非 Windows 用 pid 探活；Windows 走三态 procState（pid 文件优先、清单兜底）。
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const opts = parseArgs(process.argv.slice(2));
+const action = opts._[0];
+const outDir = resolve(opts.out ?? join(process.cwd(), '.capture'));
+if (action === 'start') {
+  mkdirSync(outDir, { recursive: true });
+  if (process.platform === 'win32') {
+    const st = procState(outDir);
+    if (st.state === 'running') {
+      console.log(JSON.stringify({ ok: false, reason: 'already running', pid: st.pid }));
+      process.exit(1);
+    }
+    if (st.state === 'unknown') {
+      // 命令行不含本目录 = 这个 pid 已被系统复用，交给人判断，别杀
+      console.log(JSON.stringify({ ok: false, reason: 'pid file points to another process', pid: st.pid, cmd: st.cmd }));
+      process.exit(1);
+    }
+    // pid 已死：删掉过期 pid 文件再照常启动
+    rmSync(join(outDir, 'recorder.pid'), { force: true });
+  } else if (isRunning(outDir)) {
+    const pid = readPidFile(outDir)?.pid;
+    console.log(JSON.stringify({ ok: false, reason: 'already running', pid }));
+    process.exit(1);
+  }
+  if (opts.fresh) rmSync(join(outDir, 'net.jsonl'), { force: true });
+
+  const browserPort = flagValue('--port') ?? readBrowserPort();
+  if (!browserPort) {
+    console.error('找不到 ego 浏览器端口（browser.json），请用 --port 指定');
+    process.exit(1);
+  }
+
+  if (process.platform === 'win32') {
+    rmSync(join(outDir, 'state.json'), { force: true }); // 免得读到上一次的旧 state 误判
+    // 老版本留下的启动脚本，现在不用了，清掉免得误读
+    rmSync(join(outDir, 'launch.vbs'), { force: true });
+    // 用 Start-Process 而不是 spawn(detached)：spawn 起的子进程仍留在调用方的 job 树里，
+    // 宿主（bash job / 终端）要等它退出才返回，start 就会挂住几分钟（2026-11-18 实测：CLI 2.9 秒就
+    // 打出了 ok，调用方却等满 120 秒超时）。Start-Process 走 CreateProcess 脱离 job 树，立即返回。
+    // -PassThru 一次调用直接拿 pid，省掉 spawn 后轮询进程清单的两轮 PowerShell（约 2.5 秒）。
+    // -ArgumentList 必须传单个字符串：PowerShell 原样交给 CreateProcess，含空格的路径靠双引号自保；
+    // 传数组会按空格重新拼接，路径里有空格就散架（实测 a b 目录会变成两个参数）。
+    const argLine = [RECORDER, '--out', outDir, '--port', String(browserPort)]
+      .map((a) => `"${a}"`)
+      .join(' ');
+    const stateFile = join(outDir, 'state.json');
+    let recPid = null;
+    try {
+      const raw = execFileSync(
+        'powershell',
+        ['-NoProfile', '-NonInteractive', '-Command',
+          `Start-Process -FilePath '${process.execPath}' -ArgumentList '${argLine.replace(/'/g, "''")}' -WindowStyle Hidden -PassThru | ForEach-Object { $_.Id }`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
+      ).trim();
+      recPid = Number(raw) || null;
+    } catch (e) {
+      console.error(`启动 recorder 失败: ${String(e.message).split('\n')[0]}`);
+      process.exit(1);
+    }
+    // 等它真正写出 state.json（recorder 在 mkdir 后立刻写一次），直接死掉就别报成功
+    const deadline = Date.now() + 5000;
+    while (!existsSync(stateFile) && Date.now() < deadline) sleepSync(50);
+    if (!recPid || !existsSync(stateFile)) {
+      console.error('recorder 启动后没有存活');
+      console.error(`启动命令: ${process.execPath} ${RECORDER} --out "${outDir}" --port ${browserPort}`);
+      console.error(`Start-Process 返回 pid: ${recPid ?? '(无)'}，state.json 是否写出: ${existsSync(stateFile)}`);
+      // 失败时已起的子进程要收掉，否则它没有 pid 文件，之后谁也找不到。
+      if (recPid) {
+        try {
+          execFileSync('taskkill', ['/PID', String(recPid), '/T', '/F'], { stdio: 'ignore' });
+          console.error(`已清理失败启动的子进程 pid: ${recPid}`);
+        } catch (e) {
+          console.error(`清理 pid ${recPid} 失败: ${String(e.message).split('\n')[0]}`);
+        }
+      }
+      process.exit(1);
+    }
+    const info = { pid: recPid, startedAt: new Date().toISOString(), out: outDir };
+    writeFileSync(join(outDir, 'recorder.pid'), JSON.stringify(info));
+    console.log(JSON.stringify({ ok: true, ...info }));
+    process.exit(0);
+  }
+
+  const child = spawn(process.execPath, [RECORDER, '--out', outDir, '--port', String(browserPort)], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+  const info = { pid: child.pid, startedAt: new Date().toISOString(), out: outDir };
+  writeFileSync(join(outDir, 'recorder.pid'), JSON.stringify(info));
+  console.log(JSON.stringify({ ok: true, ...info }));
+  process.exit(0);
+}
+
+if (action === 'stop') {
+  const st = process.platform === 'win32' ? procState(outDir) : null;
+  if (st?.state === 'unknown') {
+    // pid 已归属别的进程：只打印，不杀。pid 文件留给下一轮 start 处理
+    console.log(`pid 文件指向的进程不属于本目录，未终止。pid: ${st.pid}`);
+    console.log(`命令行: ${st.cmd}`);
+    process.exit(0);
+  }
+  const had = process.platform === 'win32' ? st.state === 'running' : isRunning(outDir);
+  const pid = process.platform === 'win32' ? st.pid : readPidFile(outDir)?.pid ?? null;
+  if (!had) {
+    rmSync(join(outDir, 'recorder.pid'), { force: true });
+    console.log('未在运行');
+    process.exit(0);
+  }
+
+  if (process.platform === 'win32') {
+    // 规格第 7 节：Windows 直接 /T /F，1 秒内没退干净就报非 0。
+    // 不带 /F 的 taskkill 在 Windows 上对 GUI 型进程不保证终止，留它只是假装成功。
+    // 进程清单为准：同目录下所有 recorder 都清掉（旧任务可能留了不止一个）
+    for (const recPid of findRecorderPids(outDir)) {
+      try {
+        execFileSync('taskkill', ['/PID', String(recPid), '/T', '/F'], { stdio: 'ignore' });
+      } catch (e) {
+        // 进程可能已经自己退了；退没退以进程清单为准，这里只留证据
+        console.error(`taskkill ${recPid} 失败: ${String(e.message).split('\n')[0]}`);
+      }
+    }
+    for (let i = 0; i < 10 && isRunning(outDir); i++) sleepSync(100);
+    if (isRunning(outDir)) {
+      console.error(`未能终止 recorder，pid: ${findRecorderPids(outDir).join(',') || '(未知)'}`);
+      process.exit(1);
+    }
+    rmSync(join(outDir, 'recorder.pid'), { force: true });
+  } else {
+    // 非 Windows：SIGTERM → 2 秒 → SIGKILL → 1 秒仍未退才报非 0。
+    if (pid) process.kill(pid, 'SIGTERM');
+    for (let i = 0; i < 20 && pid && isAlive(pid); i++) sleepSync(100);
+    if (pid && isAlive(pid)) {
+      process.kill(pid, 'SIGKILL');
+      for (let i = 0; i < 10 && isAlive(pid); i++) sleepSync(100);
+    }
+    if (pid && isAlive(pid)) {
+      console.error(`未能终止 recorder，pid: ${pid}`);
+      process.exit(1);
+    }
+    rmSync(join(outDir, 'recorder.pid'), { force: true });
+  }
+
+  const rows = readJsonl(outDir);
+  const { hosts, apis } = summarize(rows);
+  console.log(`已停止 pid: ${pid ?? '(托管)'}`);
+  console.log(`条数: ${rows.length}`);
+  console.log(`分主机: ${[...hosts].map(([h, n]) => `${h} ${n}`).join(', ') || '-'}`);
+  console.log(`去重接口数: ${apis}`);
+  if (!existsSync(join(outDir, 'net.jsonl'))) {
+    console.log('没有抓到任何请求，跳过报告');
+    process.exit(0);
+  }
+  try {
+    execFileSync(process.execPath, [GEN, '--out', outDir], { stdio: 'ignore' });
+    console.log(`报告: ${join(outDir, 'report.md')}`);
+  } catch (e) {
+    console.error(`生成报告失败: ${e.message}`);
+  }
+  process.exit(0);
+}
+
+if (action === 'status') {
+  const st = process.platform === 'win32' ? procState(outDir) : null;
+  const running = process.platform === 'win32' ? st.state === 'running' : isRunning(outDir);
+  const pid = process.platform === 'win32' ? st.pid : readPidFile(outDir)?.pid;
+  let tail = '';
+  if (running) {
+    // targets 只从 state.json 取，取不到就报 0，不影响跑没跑的判断
+    let targets = 0;
+    try {
+      targets = JSON.parse(readFileSync(join(outDir, 'state.json'), 'utf8')).targets ?? 0;
+    } catch {}
+    tail = ` pid: ${pid ?? '-'} records: ${countRecords(outDir)} targets: ${targets}`;
+  }
+  console.log(`running: ${running}${tail}`);
+  process.exit(0);
+}
+
+if (action === 'log') {
+  const host = flagValue('--host');
+  const path = flagValue('--path');
+  const method = flagValue('--method');
+  const status = flagValue('--status');
+  const tab = flagValue('--tab');
+  if (!host && !path && !method && !status && !tab) {
+    console.error('log 需要 --host / --path / --method / --status / --tab 之一');
+    process.exit(2);
+  }
+  const rows = readJsonl(outDir);
+  const hits = rows.filter(
+    (r) =>
+      (!host || new URL(r.url).host === host) &&
+      (!path || new URL(r.url).pathname === path) &&
+      (!method || r.method === method.toUpperCase()) &&
+      (!status || String(r.status) === status) &&
+      (!tab || r.targetId === tab),
+  );
+  for (const r of hits) {
+    const u = new URL(r.url);
+    console.log(`${r.ts} ${r.method} ${u.host}${u.pathname}${u.search} ${r.status ?? '-'} ${r.durMs}ms tab:${r.targetId}`);
+  }
+  console.log(`共 ${hits.length} 条`);
+  process.exit(0);
+}
+
+if (action === 'report') {
+  if (!existsSync(join(outDir, 'net.jsonl'))) {
+    console.error(`没有数据：${join(outDir, 'net.jsonl')}`);
+    process.exit(1);
+  }
+  try {
+    execFileSync(process.execPath, [GEN, '--out', outDir], { stdio: ['ignore', 'ignore', 'pipe'] });
+  } catch (e) {
+    console.error(`生成报告失败: ${e.message}`);
+    process.exit(1);
+  }
+  console.log(`报告: ${join(outDir, 'report.md')}`);
+  process.exit(0);
+}
+
+console.error(`未知或未实现的动作: ${action ?? '(无)'}`);
+process.exit(2);

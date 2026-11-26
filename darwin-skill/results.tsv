@@ -1,0 +1,12 @@
+timestamp	commit	skill	old_score	new_score	status	dimension	note	eval_mode
+2026-11-18T19:30	2c8f745	net-capture	-	67.1	baseline	-	按9维打分: d1=9 d2=7 d3=7 d4=3 d5=9 d6=8 d7=6 d8=6 d9=3。加权短板 d8=9.2 > d7=4.8 > d4=4.2=d9	paired
+2026-11-18T19:28	e8553d1	net-capture	67.1	-	keep	d7架构+d3失败模式	SKILL.md同步Start-Process实现事实+4条实测陷阱(禁改回spawn/ArgumentList单字符串/引号命令行需token化匹配)	paired 3judge unanimous clear
+2026-11-18T19:30	e8925fb	net-capture	-	-	keep	d9反例与黑名单	新增「不要做」7条；3judge全判after更好但均margin=slight，一致指出其中5条是正文复述、形成双真相源，留待下轮修剪	paired 3better/0worse, all slight
+2026-11-18T19:32	9dea650	net-capture	-	-	keep	d7整体架构(去重)	「不要做」7条→2条真新增，加"不重复正文"维护锁；3judge全判after更好（2 slight/1 clear），砍掉的5条经逐个核对在正文均存活	paired 3better/0worse
+2026-11-18T20:22	198629b	ec-pipeline	-	triage	keep	d9反例与黑名单	新增「不要做什么」7条+红线动作段，建 test-prompts.json（3条）；证据来自并行会话实测：手改 state.json 22次 / check 报未通过6次 / 25次手输--result / pwsh 504次	paired 3better/0worse, all slight；judge一致指出与正文重复→已按意见收敛计数与交叉引用
+2026-11-18T20:39	26db2fc	ec-pipeline	-	triage	keep	d4检查点设计	原「硬停」散文→独立小节「🛑 CHECKPOINT：三处必须停手等用户点头」5列闸门表（停手条件/停手前要贴的/点头后才允许跑）+「用户没回就继续等」；3处正文重复改成指回编号	paired 3better/0worse, all slight；两judge点名双真相源→已改正文3处为「见 CHECKPOINT 第N条」，并修正🔴误当列名、第3条(entry)表述
+2026-11-18T20:41	5a8ae7e	ec-pipeline	-	triage	keep	d3失败模式编码	「三类失败怎么处理」由3条散文→「触发条件→一线修复→仍失败兜底」三列表；补「还在跑 vs 没派发」「run已下发只读续看 vs 从未下发才重跑」二分支；命令块保留	paired 3better/0worse, all slight；两judge指出兜底列与反例黑名单#3冲突+丢失成因说明→已改「已下发只读续看/未下发才重跑」并补回成因
+2026-11-23T09:58	6f902ee	ec-export-instance	-	-	keep	d3失败模式+d5可执行具体性	E605 实测：--name-prefix e605 严格 startswith 命中0台静默产空表。改为整名startswith或按-切段整段相等(>=3字符)，0命中打池内样例；SKILL.md/pipeline NEXT_HINT 同步「前缀直接填批次号」；新增 test_prefix_match.py 8 用例	pending-judge（仅实测验证：9台命中、0命中告警、85 tests passed）
+2026-11-23T12:44	0cf5d04	ec-pipeline	-	-	keep	d3失败模式+d7整体架构	unixbench 与 fio 一起起、合并成一条压测轮询；补角色 NA 判据与 FIO_STATUS 汇总键（只报 FIO_SD/FIO_BIO 时 check 打不上勾）	paired 3better/0worse, all clear
+2026-11-24T10:40	4426104	ec-role	-	-	keep	d3失败模式+d5可执行具体性+d7整体架构	ensure 一键闭环（验活→续票→切→复查）+ 续票先验后写并回填账套 + 无 psutil 时 tasklist/os.kill 真查进程；实测 已对0.6s/需切1.3s/token死2.0s（原5分钟）；76→95 tests	paired 3better/0worse, all clear
+2026-11-24T14:52	7defba8	ec-browser-login	-	3-0 better	ec-browser-login	43s四调用形状收进单条start_chrome.mjs（robots.txt建站点+100ms轮询+location.href判据）；三份盲评后修正判据降级/数字夸大/cookie并发/空操作输出/测试集矛盾；实测脚本0.47-0.9s，退出码0/2/1三分支真跑	paired 3better/0worse, 2clear/1slim

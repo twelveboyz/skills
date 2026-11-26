@@ -1,0 +1,3 @@
+interface:
+  display_name: "Skill Perf Audit"
+  short_description: "审计 skill 执行效率，出量化基线与提速改造"

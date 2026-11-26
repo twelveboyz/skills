@@ -1,0 +1,17 @@
+[
+  {
+    "id": 1,
+    "prompt": "帮我抓一下这个页面调了什么接口",
+    "expected": "调 start 起后台 recorder，回一句已开始 + 输出目录，然后不等抓包直接继续别的事；不阻塞对话"
+  },
+  {
+    "id": 2,
+    "prompt": "停了，把抓到的东西整理成文档给我",
+    "expected": "先 stop 拿 pid/条数/分主机/去重接口数，再用 report.md 出报告；给用户摘要而不是把整个 report.md 倒出来"
+  },
+  {
+    "id": 3,
+    "prompt": "还在跑吗？抓了多少了？顺便看看有没有调 /api/xxx 这个接口",
+    "expected": "先 status 一行确认，再用 log --path 窄取该接口；不整份读 net.jsonl"
+  }
+]

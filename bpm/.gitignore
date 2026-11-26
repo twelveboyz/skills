@@ -1,0 +1,21 @@
+# 运行时状态目录（config、4A 会话、JWT、两个 Chrome profile）—— 绝不入库
+cache/
+
+# 兜底：万一有人用 BPM_STATE_DIR 指回仓库根
+config.json
+session.json
+token.json
+auth-log.json
+chrome-profile/
+chrome-ui-profile/
+*.log
+manifest.json
+
+# 输出产物
+bpm-downloads/
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+desktop.ini
+~$*
